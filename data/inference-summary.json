@@ -1,0 +1,170 @@
+{
+  "schema": "meta-model-real-trace/1",
+  "task": "Adding",
+  "created_utc": "2026-09-22T09:27:07.696307+00:00",
+  "checkpoint": {
+    "file": "mixtensor-score-only-v1-training/runs/adding/predictor/best-101.pt",
+    "sha256": "e9713a6d1efe155afd30326c55ebc7719e4f97693193c1a022e04167fc52e405",
+    "epoch": 49,
+    "seed": 101,
+    "config": {
+      "width": 32,
+      "layers": 2,
+      "sparse": true,
+      "objective": "normalized_score"
+    },
+    "parameters": 13545,
+    "training_architectures": 396,
+    "validation_architectures": 32
+  },
+  "runtime": {
+    "torch": "2.10.0",
+    "device": "cpu",
+    "dtype": "float32",
+    "task_batch_size_for_encoding": 256,
+    "meta_batch_size": 1
+  },
+  "source_hashes": {
+    "src/matrix_dsl/metamodel/encoding.py": "fe9edcd634331c13f546b367930af8e2209516092e8fd916e1a2b584428b715b",
+    "src/matrix_dsl/metamodel/structured.py": "6ff98a903337d4fd11e36618d452ecd17cefb7496779fadfbd5670db31a9a8f9",
+    "src/matrix_dsl/metamodel/diagonal.py": "cd7b1d40b39b69bef434cbda02c949b0ce399c48f1dc6a845cb804893b78f9ec"
+  },
+  "feature_columns": [
+    "INPUT",
+    "PARAMETER",
+    "OUTPUT",
+    "PROJECT",
+    "MIX",
+    "COMPARE",
+    "ROUTE",
+    "NORMALIZE",
+    "AGGREGATE",
+    "SHIFT",
+    "PERMUTE",
+    "RESHAPE",
+    "REDUCE",
+    "BROADCAST",
+    "ADD",
+    "MUL",
+    "GATE",
+    "CONCAT",
+    "NONLINEAR",
+    "NORM",
+    "REPEAT",
+    "SCAN",
+    "rank",
+    "numel",
+    "dim0",
+    "dim1",
+    "dim2",
+    "dim3",
+    "stored_depth",
+    "scope_depth",
+    "steps",
+    "shared",
+    "per_step",
+    "axis",
+    "offset",
+    "trainable",
+    "parameter_numel",
+    "activation:relu",
+    "activation:gelu",
+    "activation:silu",
+    "activation:sigmoid",
+    "activation:tanh",
+    "activation:identity",
+    "reducer:sum",
+    "reducer:mean",
+    "reducer:max"
+  ],
+  "selection": "Three small loop-free architectures from the meta-training set, selected by graph size and varied measured score, before inspecting predictions. Not held-out evaluation.",
+  "results": [
+    {
+      "name": "g1000000",
+      "split": "train",
+      "predicted_score": 0.6731724739074707,
+      "measured_score": 0.508034178408066,
+      "absolute_error": 0.16513829549940473,
+      "gains": {
+        "a": 1.0009187459945679,
+        "b": 0.01401261705905199
+      },
+      "measurements": [
+        {
+          "seed": 11,
+          "status": "completed",
+          "validation_nmse": 1.0827913284301758,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.508020419400753,
+          "sha256": "9381a5444e5dff7624d24aa5b2fae5544a5e64a512894e650cf1ae8fa068f2c3"
+        },
+        {
+          "seed": 23,
+          "status": "completed",
+          "validation_nmse": 1.082672119140625,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.508047937415379,
+          "sha256": "5ddc621e4ed3c3721543bb26634d36a49ae1489786589b834f9bd3710e9ae79d"
+        }
+      ]
+    },
+    {
+      "name": "g11001627",
+      "split": "train",
+      "predicted_score": 0.5931401252746582,
+      "measured_score": 0.6677145953316759,
+      "absolute_error": 0.07457447005701767,
+      "gains": {
+        "a": 1.0009187459945679,
+        "b": 0.01401261705905199
+      },
+      "measurements": [
+        {
+          "seed": 11,
+          "status": "completed",
+          "validation_nmse": 0.6244486570358276,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.6416454102940343,
+          "sha256": "8fd9ab6d6f19e44aa4a9ba9bfed5cd18676ce7a42ee2ec14f0a3ae5798604db3"
+        },
+        {
+          "seed": 23,
+          "status": "completed",
+          "validation_nmse": 0.4934951663017273,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.6937837803693175,
+          "sha256": "5432f57f57e97472ef24998a2e76f2e08c0fcf83d9eadf9666bd9f5211ebc95b"
+        }
+      ]
+    },
+    {
+      "name": "g1000099",
+      "split": "train",
+      "predicted_score": 0.9220397472381592,
+      "measured_score": 0.9406126709561942,
+      "absolute_error": 0.018572923718034984,
+      "gains": {
+        "a": 1.0009187459945679,
+        "b": 0.01401261705905199
+      },
+      "measurements": [
+        {
+          "seed": 11,
+          "status": "completed",
+          "validation_nmse": 0.06892631202936172,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.941933394908781,
+          "sha256": "c4193634f83c07479df0dcc7a5e885ba4ca7cada1c05733420e720b3b2806ce0"
+        },
+        {
+          "seed": 23,
+          "status": "completed",
+          "validation_nmse": 0.0722644180059433,
+          "zero_validation_nmse": 1.1180953979492188,
+          "score": 0.9392919470036072,
+          "sha256": "d1c5498c3f8c5e10900472e99d9cc87668131a63d0d26d77656fd93b751f24ec"
+        }
+      ]
+    }
+  ]
+}

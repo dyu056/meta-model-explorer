@@ -1,0 +1,117 @@
+<!doctype html><meta charset="utf-8"><title>diagonal.py</title><style>body{font:15px/1.7 monospace;background:#f7fafc;color:#203448;padding:24px}a{color:#176b85}pre{white-space:pre-wrap;overflow-wrap:anywhere}span:target{background:#fff0b8;display:block}</style><a href="../index.html">返回推理页面</a> · <a download href="diagonal.py">下载源码</a><h1>diagonal.py</h1><pre><span id="L1">   1  &quot;&quot;&quot;V2: diagonal Q/K/V and positive, structural-type-shared pair scaling.</span>
+<span id="L2">   2  </span>
+<span id="L3">   3  Pair matrices are indexed [receiver, source]. No node-index-specific parameters</span>
+<span id="L4">   4  or learned dense Q/K/V projections are used. Exported weights describe routing,</span>
+<span id="L5">   5  not causal contributions to task loss.</span>
+<span id="L6">   6  &quot;&quot;&quot;</span>
+<span id="L7">   7  import math</span>
+<span id="L8">   8  </span>
+<span id="L9">   9  import torch</span>
+<span id="L10">  10  from torch import nn</span>
+<span id="L11">  11  from torch.nn import functional as F</span>
+<span id="L12">  12  </span>
+<span id="L13">  13  from .encoding import FEATURE_COLUMNS</span>
+<span id="L14">  14  </span>
+<span id="L15">  15  RELATION_TYPES = (&#x27;self&#x27;, &#x27;direct_predecessor&#x27;, &#x27;other_ancestor&#x27;)</span>
+<span id="L16">  16  </span>
+<span id="L17">  17  </span>
+<span id="L18">  18  class DiagonalParameterDefinition(nn.Module):</span>
+<span id="L19">  19      def __init__(self, width):</span>
+<span id="L20">  20          super().__init__()</span>
+<span id="L21">  21          self.wq = nn.Parameter(torch.ones(width))</span>
+<span id="L22">  22          self.wk = nn.Parameter(torch.ones(width))</span>
+<span id="L23">  23          self.wv = nn.Parameter(torch.ones(width))</span>
+<span id="L24">  24          # softplus(inverse_softplus(1)) = 1 initially.</span>
+<span id="L25">  25          self.raw_pair_scale = nn.Parameter(torch.full((3,), math.log(math.expm1(1.))))</span>
+<span id="L26">  26  </span>
+<span id="L27">  27      def pair_scales(self):</span>
+<span id="L28">  28          return F.softplus(self.raw_pair_scale).clamp_min(1e-6)</span>
+<span id="L29">  29  </span>
+<span id="L30">  30  </span>
+<span id="L31">  31  class DiagonalRelationBlock(nn.Module):</span>
+<span id="L32">  32      def __init__(self, width):</span>
+<span id="L33">  33          super().__init__()</span>
+<span id="L34">  34          self.p = DiagonalParameterDefinition(width)</span>
+<span id="L35">  35          self.norm = nn.LayerNorm(width)</span>
+<span id="L36">  36          self.ffn = nn.Sequential(</span>
+<span id="L37">  37              nn.LayerNorm(width), nn.Linear(width, 2 * width),</span>
+<span id="L38">  38              nn.GELU(), nn.Linear(2 * width, width),</span>
+<span id="L39">  39          )</span>
+<span id="L40">  40  </span>
+<span id="L41">  41      def forward(self, h, batch, return_relations=False):</span>
+<span id="L42">  42          # h [B,N,D]; all node-count-dependent tensors come from graph structure.</span>
+<span id="L43">  43          # Explorer STEP 06 / 11: 两层分别执行节点归一化，各层参数独立。</span>
+<span id="L44">  44          # LaTeX: $$Z=\operatorname{LayerNorm}(H)$$</span>
+<span id="L45">  45          z = self.norm(h)</span>
+<span id="L46">  46          # Explorer STEP 07 / 12: 按通道逐元素缩放；V 在关系矩阵计算后求值。</span>
+<span id="L47">  47          # LaTeX: $$Q=Z\odot w_q,\quad K=Z\odot w_k,\quad V=Z\odot w_v$$</span>
+<span id="L48">  48          q, k = z * self.p.wq, z * self.p.wk</span>
+<span id="L49">  49          # Explorer STEP 08 / 13: 结构类型缩放与祖先掩码；不可达位置设为负无穷。补齐行保留自身。</span>
+<span id="L50">  50          # LaTeX: $$T=QK^{\top}/\sqrt{d},\quad C_{ij}=\max(\operatorname{softplus}(r_{type(i,j)}),10^{-6}),\quad A=\operatorname{softmax}_{j}(\operatorname{mask}_{M}(T\odot C))$$</span>
+<span id="L51">  51          similarity = q @ k.transpose(-1, -2) / math.sqrt(h.shape[-1])</span>
+<span id="L52">  52          n = h.shape[1]</span>
+<span id="L53">  53          eye = torch.eye(n, dtype=torch.bool, device=h.device)[None]</span>
+<span id="L54">  54          kind = torch.where(batch[&#x27;distances&#x27;] == 1, 1, 2)</span>
+<span id="L55">  55          kind = torch.where(eye, 0, kind)</span>
+<span id="L56">  56          scales = self.p.pair_scales()</span>
+<span id="L57">  57          pair_scale = scales[kind]</span>
+<span id="L58">  58          weighted = similarity * pair_scale</span>
+<span id="L59">  59          # Padding rows retain a self entry to avoid all-masked softmax; padding</span>
+<span id="L60">  60          # cannot send messages to valid nodes and is excluded from readout.</span>
+<span id="L61">  61          allowed = batch[&#x27;allowed&#x27;] &amp; batch[&#x27;valid&#x27;][:, None, :]</span>
+<span id="L62">  62          allowed = allowed | (eye &amp; ~batch[&#x27;valid&#x27;][:, :, None])</span>
+<span id="L63">  63          logits = weighted.masked_fill(~allowed, -torch.inf)</span>
+<span id="L64">  64          relation = logits.softmax(dim=-1)</span>
+<span id="L65">  65          v = z * self.p.wv</span>
+<span id="L66">  66          # Explorer STEP 09 / 14: 聚合消息并加上本层原始输入的残差。</span>
+<span id="L67">  67          # LaTeX: $$U=H+AV$$</span>
+<span id="L68">  68          message = relation @ v</span>
+<span id="L69">  69          h = h + message</span>
+<span id="L70">  70          # Explorer STEP 10 / 15: 先归一化，再扩展通道、GELU、回投影，最后加回 U。</span>
+<span id="L71">  71          # LaTeX: $$H^{\prime}=U+\operatorname{GELU}(\operatorname{LayerNorm}(U)W_1^{\top}+b_1)W_2^{\top}+b_2$$</span>
+<span id="L72">  72          h = h + self.ffn(h)</span>
+<span id="L73">  73          debug = None</span>
+<span id="L74">  74          if return_relations:</span>
+<span id="L75">  75              debug = {&#x27;similarity&#x27;: similarity, &#x27;pair_scale&#x27;: pair_scale,</span>
+<span id="L76">  76                       &#x27;weighted_similarity&#x27;: weighted, &#x27;relation&#x27;: relation,</span>
+<span id="L77">  77                       &#x27;allowed&#x27;: allowed, &#x27;relation_type&#x27;: kind,</span>
+<span id="L78">  78                       &#x27;value&#x27;: v, &#x27;message&#x27;: message,</span>
+<span id="L79">  79                       &#x27;wq&#x27;: self.p.wq, &#x27;wk&#x27;: self.p.wk, &#x27;wv&#x27;: self.p.wv,</span>
+<span id="L80">  80                       &#x27;qk_channel_product&#x27;: self.p.wq * self.p.wk,</span>
+<span id="L81">  81                       &#x27;type_scales&#x27;: scales}</span>
+<span id="L82">  82          return h, debug</span>
+<span id="L83">  83  </span>
+<span id="L84">  84  </span>
+<span id="L85">  85  class DiagonalGraphScoreModel(nn.Module):</span>
+<span id="L86">  86      def __init__(self, width=32, layers=2, tasks=1):</span>
+<span id="L87">  87          super().__init__()</span>
+<span id="L88">  88          self.config = dict(width=width, layers=layers, tasks=tasks)</span>
+<span id="L89">  89          self.input = nn.Linear(len(FEATURE_COLUMNS), width)</span>
+<span id="L90">  90          self.blocks = nn.ModuleList([DiagonalRelationBlock(width) for _ in range(layers)])</span>
+<span id="L91">  91          # Match V1&#x27;s pooling and readout so the comparison changes the blocks.</span>
+<span id="L92">  92          self.task = nn.Embedding(tasks, 16)</span>
+<span id="L93">  93          self.readout = nn.Sequential(nn.Linear(2 * width + 17, width), nn.GELU(),</span>
+<span id="L94">  94                                       nn.Linear(width, width), nn.GELU())</span>
+<span id="L95">  95          self.score = nn.Linear(width, 1)</span>
+<span id="L96">  96          self.completion = nn.Linear(width, 1)</span>
+<span id="L97">  97  </span>
+<span id="L98">  98      def forward(self, batch, return_relations=False):</span>
+<span id="L99">  99          h = self.input(batch[&#x27;x&#x27;])</span>
+<span id="L100"> 100          relations = []</span>
+<span id="L101"> 101          for block in self.blocks:</span>
+<span id="L102"> 102              h, debug = block(h, batch, return_relations)</span>
+<span id="L103"> 103              if debug is not None:</span>
+<span id="L104"> 104                  relations.append(debug)</span>
+<span id="L105"> 105          valid = batch[&#x27;valid&#x27;].unsqueeze(-1)</span>
+<span id="L106"> 106          count = valid.sum(1).clamp_min(1)</span>
+<span id="L107"> 107          total = (h * valid).sum(1)</span>
+<span id="L108"> 108          features = torch.cat((total / count, total / 32, self.task(batch[&#x27;task&#x27;]),</span>
+<span id="L109"> 109                                count.float().log1p() / 5), dim=-1)</span>
+<span id="L110"> 110          pooled = self.readout(features)</span>
+<span id="L111"> 111          result = {&#x27;score&#x27;: self.score(pooled).squeeze(-1),</span>
+<span id="L112"> 112                    &#x27;completion_logit&#x27;: self.completion(pooled).squeeze(-1)}</span>
+<span id="L113"> 113          if return_relations:</span>
+<span id="L114"> 114              result[&#x27;relations&#x27;] = relations</span>
+<span id="L115"> 115              result[&#x27;node_states&#x27;] = h</span>
+<span id="L116"> 116          return result</span>
+</pre>

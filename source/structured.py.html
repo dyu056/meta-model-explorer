@@ -1,0 +1,215 @@
+<!doctype html><meta charset="utf-8"><title>structured.py</title><style>body{font:15px/1.7 monospace;background:#f7fafc;color:#203448;padding:24px}a{color:#176b85}pre{white-space:pre-wrap;overflow-wrap:anywhere}span:target{background:#fff0b8;display:block}</style><a href="../index.html">返回推理页面</a> · <a download href="structured.py">下载源码</a><h1>structured.py</h1><pre><span id="L1">   1  &quot;&quot;&quot;V2.1: topology-aligned structural encoding before diagonal Q/K/V.</span>
+<span id="L2">   2  </span>
+<span id="L3">   3  All pair matrices use [receiver, source]. Topological order is a display and</span>
+<span id="L4">   4  execution convention, never a positional feature. Parameters are independent of</span>
+<span id="L5">   5  node count. ``sparse=False`` is the ablation: keep sorting and fixed aggregation,</span>
+<span id="L6">   6  replace only the learned sparse transform with the identity.</span>
+<span id="L7">   7  &quot;&quot;&quot;</span>
+<span id="L8">   8  from __future__ import annotations</span>
+<span id="L9">   9  </span>
+<span id="L10">  10  import heapq</span>
+<span id="L11">  11  </span>
+<span id="L12">  12  import torch</span>
+<span id="L13">  13  from torch import nn</span>
+<span id="L14">  14  </span>
+<span id="L15">  15  from .. import functional as dsl</span>
+<span id="L16">  16  from .diagonal import DiagonalRelationBlock</span>
+<span id="L17">  17  from .encoding import FEATURE_COLUMNS</span>
+<span id="L18">  18  </span>
+<span id="L19">  19  </span>
+<span id="L20">  20  class StructureParameterDefinition(nn.Module):</span>
+<span id="L21">  21      &quot;&quot;&quot;Own structural gains and translate graph metadata into aligned matrices.</span>
+<span id="L22">  22  </span>
+<span id="L23">  23      Input is the batch_graphs dictionary. x: [B,N,F], valid: [B,N],</span>
+<span id="L24">  24      allowed/distances: [B,N,N], relations: [B,N,N,R]. ``order[b,k]`` is</span>
+<span id="L25">  25      the original index of sorted node k; inverse_order undoes that permutation.</span>
+<span id="L26">  26      Neither sorting nor fixed dependency matrices have trainable parameters.</span>
+<span id="L27">  27      &quot;&quot;&quot;</span>
+<span id="L28">  28  </span>
+<span id="L29">  29      def __init__(self, sparse: bool = True):</span>
+<span id="L30">  30          super().__init__()</span>
+<span id="L31">  31          self.sparse = sparse</span>
+<span id="L32">  32          if sparse:</span>
+<span id="L33">  33              self.self_scale = nn.Parameter(torch.tensor(1.0))</span>
+<span id="L34">  34              self.predecessor_scale = nn.Parameter(torch.tensor(0.0))</span>
+<span id="L35">  35          else:</span>
+<span id="L36">  36              self.register_buffer(&#x27;self_scale&#x27;, torch.tensor(1.0))</span>
+<span id="L37">  37              self.register_buffer(&#x27;predecessor_scale&#x27;, torch.tensor(0.0))</span>
+<span id="L38">  38  </span>
+<span id="L39">  39      @staticmethod</span>
+<span id="L40">  40      def direct_dependencies(batch):</span>
+<span id="L41">  41          &quot;&quot;&quot;Boolean [B,N,N]; shortest distance 1 identifies a direct edge.&quot;&quot;&quot;</span>
+<span id="L42">  42          valid = batch[&#x27;valid&#x27;]</span>
+<span id="L43">  43          n = valid.shape[1]</span>
+<span id="L44">  44          eye = torch.eye(n, dtype=torch.bool, device=valid.device)[None]</span>
+<span id="L45">  45          return ((batch[&#x27;distances&#x27;] == 1) &amp; batch[&#x27;allowed&#x27;] &amp; ~eye</span>
+<span id="L46">  46                  &amp; valid[:, :, None] &amp; valid[:, None, :])</span>
+<span id="L47">  47  </span>
+<span id="L48">  48      @staticmethod</span>
+<span id="L49">  49      def reorder_nodes(value, order):</span>
+<span id="L50">  50          &quot;&quot;&quot;Apply each graph&#x27;s own permutation along node axis 1.&quot;&quot;&quot;</span>
+<span id="L51">  51          shape = (*order.shape, *((1,) * (value.ndim - 2)))</span>
+<span id="L52">  52          return value.gather(1, order.reshape(shape).expand_as(value))</span>
+<span id="L53">  53  </span>
+<span id="L54">  54      @classmethod</span>
+<span id="L55">  55      def reorder_pairs(cls, value, order):</span>
+<span id="L56">  56          &quot;&quot;&quot;Synchronously permute receiver and source axes, preserving ports.&quot;&quot;&quot;</span>
+<span id="L57">  57          value = cls.reorder_nodes(value, order)</span>
+<span id="L58">  58          shape = (order.shape[0], 1, order.shape[1], *((1,) * (value.ndim - 3)))</span>
+<span id="L59">  59          return value.gather(2, order.reshape(shape).expand_as(value))</span>
+<span id="L60">  60  </span>
+<span id="L61">  61      @classmethod</span>
+<span id="L62">  62      def prepare(cls, batch):</span>
+<span id="L63">  63          &quot;&quot;&quot;Kahn topological sort; reject cycles, place padding last.</span>
+<span id="L64">  64  </span>
+<span id="L65">  65          CPU traversal is metadata preparation, not a differentiable operation.</span>
+<span id="L66">  66          Independent branches may tie; their index tie-break has no effect on</span>
+<span id="L67">  67          predictions because no node-index/bandwidth parameters are learned.</span>
+<span id="L68">  68          &quot;&quot;&quot;</span>
+<span id="L69">  69          valid = batch[&#x27;valid&#x27;]</span>
+<span id="L70">  70          if valid.ndim != 2 or valid.shape[1] == 0:</span>
+<span id="L71">  71              raise ValueError(&#x27;Expected nonempty padded node axis [B,N]&#x27;)</span>
+<span id="L72">  72          direct = cls.direct_dependencies(batch)</span>
+<span id="L73">  73          orders = []</span>
+<span id="L74">  74          for graph, mask in zip(direct.detach().cpu(), valid.detach().cpu()):</span>
+<span id="L75">  75              nodes = mask.nonzero(as_tuple=True)[0].tolist()</span>
+<span id="L76">  76              if not nodes:</span>
+<span id="L77">  77                  raise ValueError(&#x27;Each graph needs at least one valid node&#x27;)</span>
+<span id="L78">  78              degree = graph.sum(-1).tolist()</span>
+<span id="L79">  79              ready = [i for i in nodes if degree[i] == 0]</span>
+<span id="L80">  80              heapq.heapify(ready)</span>
+<span id="L81">  81              order = []</span>
+<span id="L82">  82              successors = graph.transpose(0, 1)</span>
+<span id="L83">  83              while ready:</span>
+<span id="L84">  84                  source = heapq.heappop(ready)</span>
+<span id="L85">  85                  order.append(source)</span>
+<span id="L86">  86                  for target in successors[source].nonzero(as_tuple=True)[0].tolist():</span>
+<span id="L87">  87                      degree[target] -= 1</span>
+<span id="L88">  88                      if degree[target] == 0:</span>
+<span id="L89">  89                          heapq.heappush(ready, target)</span>
+<span id="L90">  90              if len(order) != len(nodes):</span>
+<span id="L91">  91                  raise ValueError(&#x27;Topological encoding requires an acyclic dependency graph&#x27;)</span>
+<span id="L92">  92              orders.append(order + (~mask).nonzero(as_tuple=True)[0].tolist())</span>
+<span id="L93">  93          order = torch.tensor(orders, device=valid.device, dtype=torch.long)</span>
+<span id="L94">  94          # Explorer STEP 02: 拓扑排序后，节点轴与成对矩阵的两轴同步重排。</span>
+<span id="L95">  95          # LaTeX: $$X=\Pi X_{raw},\quad B=\Pi B_{raw}\Pi^\top\ (B\in\{E,M,D\})$$</span>
+<span id="L96">  96          aligned = dict(batch)</span>
+<span id="L97">  97          for key in (&#x27;x&#x27;, &#x27;valid&#x27;):</span>
+<span id="L98">  98              aligned[key] = cls.reorder_nodes(batch[key], order)</span>
+<span id="L99">  99          for key in (&#x27;allowed&#x27;, &#x27;distances&#x27;, &#x27;relations&#x27;):</span>
+<span id="L100"> 100              aligned[key] = cls.reorder_pairs(batch[key], order)</span>
+<span id="L101"> 101          return aligned, order, order.argsort(dim=1)</span>
+<span id="L102"> 102  </span>
+<span id="L103"> 103      @classmethod</span>
+<span id="L104"> 104      def fixed_matrices(cls, batch, dtype):</span>
+<span id="L105"> 105          &quot;&quot;&quot;I on valid nodes and P = row-normalized direct predecessors.</span>
+<span id="L106"> 106  </span>
+<span id="L107"> 107          P has a zero diagonal; roots have a zero row. Residual addition supplies</span>
+<span id="L108"> 108          self information exactly once during the fixed aggregation stage.</span>
+<span id="L109"> 109          &quot;&quot;&quot;</span>
+<span id="L110"> 110          valid = batch[&#x27;valid&#x27;]</span>
+<span id="L111"> 111          direct = cls.direct_dependencies(batch).to(dtype)</span>
+<span id="L112"> 112          predecessors = direct / direct.sum(-1, keepdim=True).clamp_min(1)</span>
+<span id="L113"> 113          identity = torch.diag_embed(valid.to(dtype))</span>
+<span id="L114"> 114          return identity, predecessors</span>
+<span id="L115"> 115  </span>
+<span id="L116"> 116      def matrices(self, batch, dtype):</span>
+<span id="L117"> 117          identity, predecessors = self.fixed_matrices(batch, dtype)</span>
+<span id="L118"> 118          sparse = self.self_scale.to(dtype) * identity + self.predecessor_scale.to(dtype) * predecessors</span>
+<span id="L119"> 119          return sparse, predecessors</span>
+<span id="L120"> 120  </span>
+<span id="L121"> 121  </span>
+<span id="L122"> 122  class SparseStructureEncoder(nn.Module):</span>
+<span id="L123"> 123      &quot;&quot;&quot;[B,N,D] -&gt; [B,N,D], with S = a I + b P, then (I + P) S H.</span>
+<span id="L124"> 124  </span>
+<span id="L125"> 125      a=1,b=0 initially. Gains may become signed. S is structurally sparse but is</span>
+<span id="L126"> 126      materialized as a dense batched tensor for the current small-graph backend.</span>
+<span id="L127"> 127      &quot;&quot;&quot;</span>
+<span id="L128"> 128  </span>
+<span id="L129"> 129      def __init__(self, sparse: bool = True):</span>
+<span id="L130"> 130          super().__init__()</span>
+<span id="L131"> 131          self.p = StructureParameterDefinition(sparse)</span>
+<span id="L132"> 132  </span>
+<span id="L133"> 133      def forward(self, h, sparse_matrix, predecessors):</span>
+<span id="L134"> 134          # Explorer STEP 04: 结构变换：P 为归一化直接前驱，a、b 为可学习标量。</span>
+<span id="L135"> 135          # LaTeX: $$P_{ij}=E_{ij}/\max(1,\sum_k E_{ik}),\quad S=aI+bP,\quad L=SH_0$$</span>
+<span id="L136"> 136          local = dsl.mix(h, sparse_matrix)</span>
+<span id="L137"> 137          # Explorer STEP 05: 固定前驱聚合，加回自身表示。</span>
+<span id="L138"> 138          # LaTeX: $$H_s=L+PL$$</span>
+<span id="L139"> 139          encoded = dsl.add(local, dsl.mix(local, predecessors))</span>
+<span id="L140"> 140          return encoded, local</span>
+<span id="L141"> 141  </span>
+<span id="L142"> 142  </span>
+<span id="L143"> 143  class StructuredGraphScoreModel(nn.Module):</span>
+<span id="L144"> 144      &quot;&quot;&quot;Topology -&gt; projection -&gt; sparse/fixed encoding -&gt; diagonal relation blocks.</span>
+<span id="L145"> 145  </span>
+<span id="L146"> 146      Defaults: feature width 32, two independent relation blocks. Train a separate</span>
+<span id="L147"> 147      model per task; there is no task embedding or required task ID in the batch.</span>
+<span id="L148"> 148      ``objective=&#x27;normalized_score&#x27;`` returns one sigmoid score [B] and owns no</span>
+<span id="L149"> 149      completion head. The default ``legacy`` mode retains the historical raw</span>
+<span id="L150"> 150      score/completion_logit outputs for existing relation-v2 experiments.</span>
+<span id="L151"> 151      With return_relations=True, return</span>
+<span id="L152"> 152      sorted-node states, order/inverse_order, structural matrices/states, and</span>
+<span id="L153"> 153      each block&#x27;s raw similarity, weighted similarity, softmax relation and V.</span>
+<span id="L154"> 154      Use node_order to align node IDs; use inverse_order to restore tensors.</span>
+<span id="L155"> 155      &quot;&quot;&quot;</span>
+<span id="L156"> 156  </span>
+<span id="L157"> 157      def __init__(self, width=32, layers=2, sparse=True, objective=&#x27;legacy&#x27;):</span>
+<span id="L158"> 158          super().__init__()</span>
+<span id="L159"> 159          if objective not in (&#x27;legacy&#x27;, &#x27;normalized_score&#x27;):</span>
+<span id="L160"> 160              raise ValueError(&#x27;objective must be legacy or normalized_score&#x27;)</span>
+<span id="L161"> 161          self.config = dict(width=width, layers=layers, sparse=sparse, objective=objective)</span>
+<span id="L162"> 162          self.objective = objective</span>
+<span id="L163"> 163          self.input = nn.Linear(len(FEATURE_COLUMNS), width)</span>
+<span id="L164"> 164          self.blocks = nn.ModuleList([DiagonalRelationBlock(width) for _ in range(layers)])</span>
+<span id="L165"> 165          # Masked mean, fixed-scale sum, and log node count: 2 * width + 1.</span>
+<span id="L166"> 166          self.readout = nn.Sequential(nn.Linear(2 * width + 1, width), nn.GELU(),</span>
+<span id="L167"> 167                                       nn.Linear(width, width), nn.GELU())</span>
+<span id="L168"> 168          self.score = nn.Linear(width, 1)</span>
+<span id="L169"> 169          if objective == &#x27;legacy&#x27;:</span>
+<span id="L170"> 170              self.completion = nn.Linear(width, 1)</span>
+<span id="L171"> 171          self.encoder = SparseStructureEncoder(sparse=sparse)</span>
+<span id="L172"> 172  </span>
+<span id="L173"> 173      def forward(self, batch, return_relations=False):</span>
+<span id="L174"> 174          aligned, order, inverse = self.encoder.p.prepare(batch)</span>
+<span id="L175"> 175          # Explorer STEP 03: 共享线性投影：每个节点从 46 维映射为 32 维。</span>
+<span id="L176"> 176          # LaTeX: $$H_0=XW_{in}^{\top}+b_{in}$$</span>
+<span id="L177"> 177          h = self.input(aligned[&#x27;x&#x27;])</span>
+<span id="L178"> 178          sparse, predecessors = self.encoder.p.matrices(aligned, h.dtype)</span>
+<span id="L179"> 179          projected = h</span>
+<span id="L180"> 180          h, local = self.encoder(h, sparse, predecessors)</span>
+<span id="L181"> 181          structural = h</span>
+<span id="L182"> 182          relations = []</span>
+<span id="L183"> 183          for block in self.blocks:</span>
+<span id="L184"> 184              h, debug = block(h, aligned, return_relations)</span>
+<span id="L185"> 185              if debug is not None:</span>
+<span id="L186"> 186                  relations.append(debug)</span>
+<span id="L187"> 187          # Explorer STEP 16: 只汇聚有效节点，拼接均值、固定缩放求和与节点数量。</span>
+<span id="L188"> 188          # LaTeX: $$n=\sum_i v_i,\quad t=\sum_i v_i H_i,\quad z=[t/\max(n,1);\ t/32;\ \ln(1+\max(n,1))/5]$$</span>
+<span id="L189"> 189          valid = aligned[&#x27;valid&#x27;].unsqueeze(-1)</span>
+<span id="L190"> 190          count = valid.sum(1).clamp_min(1)</span>
+<span id="L191"> 191          total = (h * valid).sum(1)</span>
+<span id="L192"> 192          features = torch.cat((total / count, total / 32,</span>
+<span id="L193"> 193                                count.float().log1p() / 5), dim=-1)</span>
+<span id="L194"> 194          # Explorer STEP 17: 图级 MLP：65 → 32 → 32。</span>
+<span id="L195"> 195          # LaTeX: $$g=\operatorname{GELU}(\operatorname{GELU}(zW_1^{\top}+b_1)W_2^{\top}+b_2)$$</span>
+<span id="L196"> 196          pooled = self.readout(features)</span>
+<span id="L197"> 197          # Explorer STEP 18: normalized_score 模式返回单一 sigmoid 分数；标签不参与前向。</span>
+<span id="L198"> 198          # LaTeX: $$\ell=gw+b,\quad \widehat{s}=\sigma(\ell)$$</span>
+<span id="L199"> 199          score = self.score(pooled).squeeze(-1)</span>
+<span id="L200"> 200          if self.objective == &#x27;normalized_score&#x27;:</span>
+<span id="L201"> 201              result = {&#x27;score&#x27;: score.sigmoid()}</span>
+<span id="L202"> 202          else:</span>
+<span id="L203"> 203              result = {&#x27;score&#x27;: score,</span>
+<span id="L204"> 204                        &#x27;completion_logit&#x27;: self.completion(pooled).squeeze(-1)}</span>
+<span id="L205"> 205          if return_relations:</span>
+<span id="L206"> 206              result.update(node_order=order, inverse_order=inverse,</span>
+<span id="L207"> 207                            node_states=h, relations=relations,</span>
+<span id="L208"> 208                            structure={&#x27;sparse_matrix&#x27;: sparse, &#x27;predecessors&#x27;: predecessors,</span>
+<span id="L209"> 209                                       &#x27;projected&#x27;: projected, &#x27;after_sparse&#x27;: local,</span>
+<span id="L210"> 210                                       &#x27;after_dependency&#x27;: structural,</span>
+<span id="L211"> 211                                       &#x27;self_scale&#x27;: self.encoder.p.self_scale,</span>
+<span id="L212"> 212                                       &#x27;predecessor_scale&#x27;: self.encoder.p.predecessor_scale,</span>
+<span id="L213"> 213                                       &#x27;valid&#x27;: aligned[&#x27;valid&#x27;]})</span>
+<span id="L214"> 214          return result</span>
+</pre>

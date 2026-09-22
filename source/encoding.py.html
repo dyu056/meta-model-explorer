@@ -1,0 +1,95 @@
+<!doctype html><meta charset="utf-8"><title>encoding.py</title><style>body{font:15px/1.7 monospace;background:#f7fafc;color:#203448;padding:24px}a{color:#176b85}pre{white-space:pre-wrap;overflow-wrap:anywhere}span:target{background:#fff0b8;display:block}</style><a href="../index.html">返回推理页面</a> · <a download href="encoding.py">下载源码</a><h1>encoding.py</h1><pre><span id="L1">   1  &quot;&quot;&quot;Label-free graph features; control scopes are connected by explicit boundary edges.&quot;&quot;&quot;</span>
+<span id="L2">   2  from dataclasses import dataclass</span>
+<span id="L3">   3  import math</span>
+<span id="L4">   4  import torch</span>
+<span id="L5">   5  from ..graph_ir.analysis import FEATURE_TYPES</span>
+<span id="L6">   6  from ..graph_ir.validation import split_ref</span>
+<span id="L7">   7  </span>
+<span id="L8">   8  PORTS=(&#x27;x&#x27;,&#x27;other&#x27;,&#x27;weight&#x27;,&#x27;weights&#x27;,&#x27;q&#x27;,&#x27;k&#x27;,&#x27;scores&#x27;,&#x27;mask&#x27;,&#x27;logits&#x27;,&#x27;values&#x27;,&#x27;xs&#x27;,&#x27;state&#x27;,&#x27;fragment&#x27;,&#x27;carry&#x27;,&#x27;y&#x27;,&#x27;out&#x27;,&#x27;capture&#x27;,&#x27;binding&#x27;,&#x27;body_output&#x27;,&#x27;self&#x27;)</span>
+<span id="L9">   9  ACTIVATIONS=(&#x27;relu&#x27;,&#x27;gelu&#x27;,&#x27;silu&#x27;,&#x27;sigmoid&#x27;,&#x27;tanh&#x27;,&#x27;identity&#x27;)</span>
+<span id="L10">  10  REDUCERS=(&#x27;sum&#x27;,&#x27;mean&#x27;,&#x27;max&#x27;)</span>
+<span id="L11">  11  NUMERIC=(&#x27;rank&#x27;,&#x27;numel&#x27;,&#x27;dim0&#x27;,&#x27;dim1&#x27;,&#x27;dim2&#x27;,&#x27;dim3&#x27;,&#x27;stored_depth&#x27;,&#x27;scope_depth&#x27;,&#x27;steps&#x27;,&#x27;shared&#x27;,&#x27;per_step&#x27;,&#x27;axis&#x27;,&#x27;offset&#x27;,&#x27;trainable&#x27;,&#x27;parameter_numel&#x27;)</span>
+<span id="L12">  12  FEATURE_COLUMNS=tuple(FEATURE_TYPES)+NUMERIC+tuple(&#x27;activation:&#x27;+s for s in ACTIVATIONS)+tuple(&#x27;reducer:&#x27;+s for s in REDUCERS)</span>
+<span id="L13">  13  </span>
+<span id="L14">  14  </span>
+<span id="L15">  15  @dataclass</span>
+<span id="L16">  16  class EncodedGraph:</span>
+<span id="L17">  17      x:torch.Tensor</span>
+<span id="L18">  18      allowed:torch.Tensor</span>
+<span id="L19">  19      relations:torch.Tensor</span>
+<span id="L20">  20      distances:torch.Tensor</span>
+<span id="L21">  21      statistics:torch.Tensor</span>
+<span id="L22">  22      ids:list[str]</span>
+<span id="L23">  23  </span>
+<span id="L24">  24  </span>
+<span id="L25">  25  def encode(graph,batch_size=64):</span>
+<span id="L26">  26      # Explorer STEP 01: 确定性编码：节点属性与有向图关系。</span>
+<span id="L27">  27      # LaTeX: $$G \mapsto (X_{raw},E_{raw},M_{raw},D_{raw}),\quad X_{raw}\in\mathbb{R}^{N\times46}$$</span>
+<span id="L28">  28      exported=graph.matrices({&#x27;B&#x27;:batch_size})</span>
+<span id="L29">  29      scopes=exported[&#x27;scopes&#x27;];keys=[];rows=[];mapping={};stats=[0.]*len(FEATURE_TYPES)</span>
+<span id="L30">  30      for scope,data in sorted(scopes.items()):</span>
+<span id="L31">  31          definitions={n[&#x27;id&#x27;]:n for n in data[&#x27;nodes&#x27;]}</span>
+<span id="L32">  32          for i,(name,kind) in enumerate(zip(data[&#x27;node_ids&#x27;],data[&#x27;node_types&#x27;])):</span>
+<span id="L33">  33              mapping[(scope,name)]=len(rows);keys.append(scope+&#x27;/&#x27;+name)</span>
+<span id="L34">  34              attrs=definitions.get(name,{}).get(&#x27;attrs&#x27;,{})</span>
+<span id="L35">  35              specs=[v for k,v in data[&#x27;tensor_specs&#x27;].items() if k.startswith(name+&#x27;:&#x27;)]</span>
+<span id="L36">  36              if not specs:</span>
+<span id="L37">  37                  specs=[e[&#x27;tensor&#x27;] for e in data[&#x27;edges&#x27;] if e[&#x27;target&#x27;]==name]</span>
+<span id="L38">  38              shape=specs[0][&#x27;shape&#x27;] if specs else []</span>
+<span id="L39">  39              dims=[math.log1p(v)/10 for v in shape[:4]]+[0.]*(4-len(shape[:4]))</span>
+<span id="L40">  40              param=data[&#x27;parameters&#x27;].get(name,{})</span>
+<span id="L41">  41              pnum=math.prod(param[&#x27;shape&#x27;]) if param else 0</span>
+<span id="L42">  42              numeric=[len(shape)/4,math.log1p(math.prod(shape))/10,*dims,</span>
+<span id="L43">  43                       data[&#x27;stored_depth&#x27;][i]/20,scope.count(&#x27;/&#x27;)/4,math.log1p(attrs.get(&#x27;steps&#x27;,0))/4,</span>
+<span id="L44">  44                       float(attrs.get(&#x27;binding&#x27;)==&#x27;shared&#x27;),float(attrs.get(&#x27;binding&#x27;)==&#x27;per_step&#x27;),</span>
+<span id="L45">  45                       float(attrs.get(&#x27;dim&#x27;,0)) if isinstance(attrs.get(&#x27;dim&#x27;,0),int) else 0.,float(attrs.get(&#x27;offset&#x27;,0)),</span>
+<span id="L46">  46                       float(param.get(&#x27;trainable&#x27;,False)),math.log1p(pnum)/10]</span>
+<span id="L47">  47              row=data[&#x27;node_features&#x27;][i]+numeric+[float(attrs.get(&#x27;activation&#x27;)==a) for a in ACTIVATIONS]+[float(attrs.get(&#x27;reducer&#x27;)==a) for a in REDUCERS]</span>
+<span id="L48">  48              rows.append(row);stats[FEATURE_TYPES.index(kind)]+=1</span>
+<span id="L49">  49      n=len(rows);relations=torch.zeros(n,n,len(PORTS));direct=torch.zeros(n,n,dtype=torch.bool)</span>
+<span id="L50">  50      def add(source,target,port):</span>
+<span id="L51">  51          direct[target,source]=True</span>
+<span id="L52">  52          relations[target,source,PORTS.index(port if port in PORTS else &#x27;capture&#x27;)]+=1</span>
+<span id="L53">  53      for scope,data in scopes.items():</span>
+<span id="L54">  54          for edge in data[&#x27;edges&#x27;]:add(mapping[(scope,edge[&#x27;source&#x27;])],mapping[(scope,edge[&#x27;target&#x27;])],edge[&#x27;target_port&#x27;])</span>
+<span id="L55">  55      for relation in exported[&#x27;hierarchy&#x27;]:</span>
+<span id="L56">  56          parent=relation[&#x27;parent_scope&#x27;];child=relation[&#x27;body_scope&#x27;];control=relation[&#x27;control_node&#x27;]</span>
+<span id="L57">  57          # Hierarchical input bindings preserve which external tensor is read by the body.</span>
+<span id="L58">  58          for port,refs in relation[&#x27;bindings&#x27;].items():</span>
+<span id="L59">  59              target_port=&#x27;fragment&#x27; if port==&#x27;xs&#x27; else port</span>
+<span id="L60">  60              if (child,target_port) not in mapping:continue</span>
+<span id="L61">  61              for ref in refs if isinstance(refs,list) else [refs]:</span>
+<span id="L62">  62                  name,_=split_ref(ref)</span>
+<span id="L63">  63                  add(mapping[(parent,name)],mapping[(child,target_port)],&#x27;binding&#x27;)</span>
+<span id="L64">  64          for name,kind in zip(scopes[child][&#x27;node_ids&#x27;],scopes[child][&#x27;node_types&#x27;]):</span>
+<span id="L65">  65              if kind==&#x27;OUTPUT&#x27;:add(mapping[(child,name)],mapping[(parent,control)],&#x27;body_output&#x27;)</span>
+<span id="L66">  66      distance=torch.full((n,n),n+1,dtype=torch.long);distance[direct]=1;distance.fill_diagonal_(0)</span>
+<span id="L67">  67      for k in range(n):distance=torch.minimum(distance,distance[:,k,None]+distance[k,None,:])</span>
+<span id="L68">  68      allowed=distance&lt;=n</span>
+<span id="L69">  69      relations[torch.arange(n),torch.arange(n),PORTS.index(&#x27;self&#x27;)]=1</span>
+<span id="L70">  70      distances=distance.clamp(max=8)</span>
+<span id="L71">  71      pnum=sum(math.prod(p.shape) for p in graph.parameters.values() if p.trainable)</span>
+<span id="L72">  72      summary=[math.log1p(v) for v in stats]+[math.log1p(pnum),math.log1p(n),float(max(d[&#x27;stored_depth&#x27;][-1] for d in scopes.values()))/20]</span>
+<span id="L73">  73      return EncodedGraph(torch.tensor(rows,dtype=torch.float32),allowed,relations,distances,torch.tensor(summary,dtype=torch.float32),keys)</span>
+<span id="L74">  74  </span>
+<span id="L75">  75  </span>
+<span id="L76">  76  def batch_graphs(graphs,task_ids=None):</span>
+<span id="L77">  77      &quot;&quot;&quot;Pad graphs; omit task_ids for one-model-per-task predictors.</span>
+<span id="L78">  78  </span>
+<span id="L79">  79      Explicit task_ids retain the legacy task field for older predictors.</span>
+<span id="L80">  80      &quot;&quot;&quot;</span>
+<span id="L81">  81      if not graphs or (task_ids is not None and len(graphs)!=len(task_ids)):</span>
+<span id="L82">  82          raise ValueError(&#x27;Need nonempty graphs and matching task_ids when supplied&#x27;)</span>
+<span id="L83">  83      size=max(len(g.ids) for g in graphs);b=len(graphs)</span>
+<span id="L84">  84      x=torch.zeros(b,size,len(FEATURE_COLUMNS));valid=torch.zeros(b,size,dtype=torch.bool)</span>
+<span id="L85">  85      mask=torch.eye(size,dtype=torch.bool).expand(b,-1,-1).clone()</span>
+<span id="L86">  86      relations=torch.zeros(b,size,size,len(PORTS));dist=torch.full((b,size,size),8,dtype=torch.long)</span>
+<span id="L87">  87      for i,g in enumerate(graphs):</span>
+<span id="L88">  88          n=len(g.ids);x[i,:n]=g.x;valid[i,:n]=True;mask[i,:n,:n]=g.allowed</span>
+<span id="L89">  89          relations[i,:n,:n]=g.relations;dist[i,:n,:n]=g.distances</span>
+<span id="L90">  90      batch={&#x27;x&#x27;:x,&#x27;valid&#x27;:valid,&#x27;allowed&#x27;:mask,&#x27;relations&#x27;:relations,&#x27;distances&#x27;:dist,</span>
+<span id="L91">  91             &#x27;statistics&#x27;:torch.stack([g.statistics for g in graphs])}</span>
+<span id="L92">  92      if task_ids is not None:</span>
+<span id="L93">  93          batch[&#x27;task&#x27;]=torch.tensor(task_ids,dtype=torch.long)</span>
+<span id="L94">  94      return batch</span>
+</pre>
